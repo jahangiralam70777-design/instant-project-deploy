@@ -97,8 +97,8 @@ export const adminRoutineStats = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const ctx = context as unknown as Ctx;
-    const sb = ctx.supabase;
-    await assertAdmin(sb, ctx.userId);
+    await assertAdmin(ctx.supabase, ctx.userId);
+    const sb = await getAdminReader();
 
     const [routinesRes, tasksRes] = await Promise.all([
       sb.from("study_routines").select("id,user_id,type,level_code,subject_id,chapter_id,is_archived,created_at,updated_at"),
