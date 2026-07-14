@@ -29,6 +29,11 @@ const TABLE_SCOPES: Record<string, string[][]> = {
     ["exam-batch", "student", "history"],
     ["exam-batch", "student", "leaderboard"],
     ["exam-batch", "student", "progress"],
+    // Session-level fallback drives the student enrollment subject list
+    // (subjects at the session's level). If admin changes a session's
+    // level, the student's subject picker must re-fetch on the next tick.
+    ["exam-batch", "student", "session-subjects"],
+    ["exam-batch", "student", "subjects"],
   ],
   exam_batch_subjects: [
     ["exam-batch", "admin", "subjects"],
