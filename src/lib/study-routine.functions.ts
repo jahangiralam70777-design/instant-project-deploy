@@ -594,7 +594,13 @@ export function expandOccurrenceDates(
     | "end_date"
     | "due_date"
   >,
-  horizonDays = 90,
+  // When the user does NOT pick an end date, we only materialize the next
+  // 30 days of occurrences. This keeps `study_routine_tasks` bounded (a
+  // Daily routine with no end date used to create ~90 rows) while still
+  // giving the student a month of visible planned tasks. If they DO pick
+  // an explicit end date, the caller passes that value through
+  // `input.end_date` / `input.due_date` and generation stops there.
+  horizonDays = 30,
 ): string[] {
   const today = todayInBD();
   const startBound = input.start_date > today ? input.start_date : today;
