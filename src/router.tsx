@@ -16,7 +16,16 @@ export const getRouter = () => {
         staleTime: 5 * 60_000,
         gcTime: 30 * 60_000,
         refetchOnWindowFocus: false,
-        refetchOnMount: false,
+        // Refetch on mount ONLY when the cached data is stale (TanStack's
+        // default). Combined with `staleTime: 5m`, page switches inside
+        // that window still hit cache instantly, but any query that was
+        // marked stale via `invalidateQueries` (admin creates Level /
+        // Subject / etc.) refetches the next time an observing component
+        // mounts — no manual refresh required. `refetchOnMount: false`
+        // suppressed those refetches even when the data was stale, so a
+        // dropdown that lived inside a not-yet-open dialog would keep
+        // showing pre-invalidation data on the next open.
+        refetchOnMount: true,
         // Auto-recover when the network comes back without forcing a refresh.
         refetchOnReconnect: "always",
         // 3 retries with exponential backoff (capped at 5s) — but skip retrying
