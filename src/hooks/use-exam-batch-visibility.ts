@@ -30,9 +30,13 @@ export function useExamBatchVisibility() {
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
+    // NOTE: do NOT set `{ private: true }` here — private channels require
+    // Realtime Authorization policies on `realtime.messages` that this
+    // project does not configure. With `private: true`, Supabase silently
+    // rejects the join and no postgres_changes ever arrive, which is why
+    // students used to have to refresh after an admin hid/unhid the module.
     const channel = supabase.channel(
       `exam-batch-visibility-${Math.random().toString(36).slice(2, 8)}`,
-      { config: { private: true } },
     );
 
     const subscribe = async () => {
