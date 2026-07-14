@@ -42,6 +42,19 @@ async function assertAdmin(sb: SupabaseClient<Database>, userId: string): Promis
   throw new Error("Forbidden: admin role required");
 }
 
+// After `assertAdmin` has verified the caller, all monitoring reads run
+// through the service-role client. The Study Routine tables have
+// per-row RLS scoped to `auth.uid() = user_id`; the admin_read policies
+// only exist in the consolidated migration and may not be applied on
+// every deployment. Using the admin client here guarantees the Admin
+// Routine Manager sees every student's routines/tasks regardless of
+// whether the admin_read policies are installed, while remaining safe
+// because assertAdmin has already gated access.
+async function getAdminReader() {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  return supabaseAdmin as unknown as SupabaseClient<Database>;
+}
+
 
 async function loadUserDirectory(userIds: string[]): Promise<Record<string, { email: string | null; name: string | null }>> {
   const out: Record<string, { email: string | null; name: string | null }> = {};
