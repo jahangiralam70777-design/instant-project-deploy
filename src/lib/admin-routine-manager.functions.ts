@@ -312,9 +312,16 @@ export const adminRoutineStudents = createServerFn({ method: "POST" })
     const sb = ctx.supabase as any;
     await assertAdmin(sb, ctx.userId);
 
-    // Fast path: call the SQL RPC which performs aggregation, filtering,
-    // sorting and pagination server-side. This scales to hundreds of
-    // thousands of rows since only ONE page ever crosses the wire.
+    // Fast path: server-side aggregation RPC (present in
+    // STUDY_ROUTINE_COMPLETE_FINAL.sql). Falls back to a service-role
+    // in-memory aggregate when the RPC is missing on this deployment or
+    // errors — this guarantees the Admin Routine Manager Students table
+    // always shows every student that has at least one routine, without
+    // requiring a new migration to be applied first.
+    let rows: Array<any> = [];
+    let total = 0;
+    let usedFallback = false;
+
     const { data: rpcRows, error: rpcErr } = await sb.rpc(
       "admin_routine_students",
       {
@@ -332,16 +339,165 @@ export const adminRoutineStudents = createServerFn({ method: "POST" })
     );
 
     if (rpcErr) {
-      // Bubble up so the UI can retry; do not silently fall back to a
-      // full-table in-memory scan (that is the failure mode this change fixes).
-      throw new Error(rpcErr.message || "Failed to load admin routine students");
+      // Do NOT throw — the RPC may not be installed on this deployment.
+      // Log for observability and fall through to the service-role path.
+      console.warn(
+        "[adminRoutineStudents] RPC failed, using service-role fallback:",
+        rpcErr.message,
+      );
+      usedFallback = true;
+    } else {
+      rows = (rpcRows ?? []) as Array<any>;
+      total = Number(rows[0]?.total_count ?? 0);
+      // Empty RPC result on a deployment that has students+routines is
+      // almost always a stale RPC (e.g. `is_archived` filter with legacy
+      // rows, or profiles JOIN dropping rows). Recompute via service role.
+      if (rows.length === 0) usedFallback = true;
     }
 
-    const rows = (rpcRows ?? []) as Array<any>;
-    const total = Number(rows[0]?.total_count ?? 0);
+    if (usedFallback) {
+      const adminSb = (await getAdminReader()) as any;
+      const [rRes, tRes] = await Promise.all([
+        adminSb
+          .from("study_routines")
+          .select("user_id,type,level_code,subject_id,chapter_id,is_archived,created_at"),
+        adminSb
+          .from("study_routine_tasks")
+          .select("user_id,status,start_time,end_time,updated_at,created_at"),
+      ]);
+      const allRoutines: any[] = (rRes.data ?? []).filter(
+        (r: any) => r.is_archived !== true,
+      );
+      const filtered = allRoutines.filter((r: any) => {
+        if (data.levelCode && r.level_code !== data.levelCode) return false;
+        if (data.subjectId && r.subject_id !== data.subjectId) return false;
+        if (data.chapterId && r.chapter_id !== data.chapterId) return false;
+        if (data.routineType && r.type !== data.routineType) return false;
+        return true;
+      });
+      type Agg = {
+        user_id: string;
+        routine_count: number;
+        created_at: string | null;
+        primary_created: string;
+        level_code: string | null;
+        subject_id: string | null;
+        chapter_id: string | null;
+        routine_type: string | null;
+        total_tasks: number;
+        completed: number;
+        pending: number;
+        study_minutes: number;
+        last_active: string | null;
+      };
+      const perUser = new Map<string, Agg>();
+      for (const r of filtered) {
+        const cur = perUser.get(r.user_id);
+        if (!cur) {
+          perUser.set(r.user_id, {
+            user_id: r.user_id,
+            routine_count: 1,
+            created_at: r.created_at,
+            primary_created: r.created_at,
+            level_code: r.level_code ?? null,
+            subject_id: r.subject_id ?? null,
+            chapter_id: r.chapter_id ?? null,
+            routine_type: r.type ?? null,
+            total_tasks: 0,
+            completed: 0,
+            pending: 0,
+            study_minutes: 0,
+            last_active: null,
+          });
+        } else {
+          cur.routine_count += 1;
+          if (r.created_at && (!cur.created_at || r.created_at < cur.created_at))
+            cur.created_at = r.created_at;
+          if (r.created_at && r.created_at > cur.primary_created) {
+            cur.primary_created = r.created_at;
+            cur.level_code = r.level_code ?? null;
+            cur.subject_id = r.subject_id ?? null;
+            cur.chapter_id = r.chapter_id ?? null;
+            cur.routine_type = r.type ?? null;
+          }
+        }
+      }
+      for (const t of (tRes.data ?? []) as any[]) {
+        const agg = perUser.get(t.user_id);
+        if (!agg) continue; // only count tasks for students with routines
+        agg.total_tasks += 1;
+        if (t.status === "completed") {
+          agg.completed += 1;
+          const [h1, m1] = String(t.start_time ?? "00:00").split(":").map(Number);
+          const [h2, m2] = String(t.end_time ?? "00:00").split(":").map(Number);
+          const mins = h2 * 60 + m2 - (h1 * 60 + m1);
+          if (mins > 0) agg.study_minutes += mins;
+        } else {
+          agg.pending += 1;
+        }
+        const stamp = t.updated_at ?? t.created_at ?? null;
+        if (stamp && (!agg.last_active || stamp > agg.last_active))
+          agg.last_active = stamp;
+      }
+
+      const userIds = [...perUser.keys()];
+      const dir = userIds.length ? await loadUserDirectory(userIds) : {};
+      let merged = userIds.map((uid) => {
+        const a = perUser.get(uid)!;
+        return {
+          ...a,
+          completion: a.total_tasks > 0
+            ? Math.round((a.completed * 100) / a.total_tasks)
+            : 0,
+          email: dir[uid]?.email ?? null,
+          name: dir[uid]?.name ?? null,
+        };
+      });
+      if (data.search) {
+        const q = data.search.toLowerCase();
+        merged = merged.filter(
+          (m) =>
+            (m.name ?? "").toLowerCase().includes(q) ||
+            (m.email ?? "").toLowerCase().includes(q),
+        );
+      }
+      if (data.status === "active") merged = merged.filter((m) => m.completed > 0);
+      else if (data.status === "inactive") merged = merged.filter((m) => m.completed === 0);
+
+      const dir_ = data.sortDir === "asc" ? 1 : -1;
+      const cmp = (a: any, b: any): number => {
+        switch (data.sortBy) {
+          case "completion": return (a.completion - b.completion) * dir_;
+          case "tasks": return (a.total_tasks - b.total_tasks) * dir_;
+          case "created": return String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")) * dir_;
+          case "last_active":
+          default:
+            return String(a.last_active ?? "").localeCompare(String(b.last_active ?? "")) * dir_;
+        }
+      };
+      merged.sort(cmp);
+      total = merged.length;
+      const start = (data.page - 1) * data.pageSize;
+      rows = merged.slice(start, start + data.pageSize).map((m) => ({
+        user_id: m.user_id,
+        routine_count: m.routine_count,
+        total_tasks: m.total_tasks,
+        completed: m.completed,
+        pending: m.pending,
+        study_minutes: m.study_minutes,
+        last_active: m.last_active,
+        created_at: m.created_at,
+        level_code: m.level_code,
+        subject_id: m.subject_id,
+        chapter_id: m.chapter_id,
+        routine_type: m.routine_type,
+        completion: m.completion,
+        email: m.email,
+        name: m.name,
+      }));
+    }
 
     // Fetch identity for the paginated user_ids only (small, bounded set).
-    const pageUserIds = rows.map((r) => r.user_id as string);
     const missingIdentityIds = rows
       .filter((r) => !r.email && !r.name)
       .map((r) => r.user_id as string);
